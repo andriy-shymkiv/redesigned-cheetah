@@ -1,0 +1,824 @@
+---
+title: TWAP Orders
+description: Integration guide for Time-Weighted Average Price (TWAP) orders — splitting a large swap into smaller slices executed at regular intervals.
+---
+
+import { Aside, Card, CardGrid, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+
+TWAP (Time-Weighted Average Price) orders split a large swap into multiple smaller slices executed at regular intervals. This reduces price impact and averages out short-term volatility.
+
+## Overview
+
+There are two TWAP order types:
+
+<CardGrid>
+  <Card title="TWAP Sell (TWAPOrder)">
+    Fixed source input. Divides `totalSrcAmount` into `numSlices` equal parts, selling each slice for at least `destAmountPerSlice`.
+  </Card>
+  <Card title="TWAP Buy (TWAPBuyOrder)">
+    Fixed destination output. Divides `totalDestAmount` into `numSlices` equal parts, buying each slice while spending at most `maxSrcAmount` total.
+  </Card>
+</CardGrid>
+
+Both types execute one slice every `interval` seconds, with each slice going through the standard Delta auction process independently. Both support same-chain and cross-chain (bridge) swaps.
+
+## Integration Flow
+
+```text
+1. GET  /quote          — get a price quote for one slice
+2. POST /orders/build   — build an unsigned TWAP order
+3. Sign the EIP-712 typed data
+4. POST /orders         — submit the signed order
+5. GET  /orders/:id     — poll for status
+```
+
+---
+
+## TWAP Sell Orders
+
+<Steps>
+
+1. ### Get a Price Quote
+
+   Request a quote for a **single slice** amount (i.e. `floor(totalSrcAmount / numSlices)`).
+
+   ```text
+   GET /quote
+   ```
+
+   | Parameter | Type | Required | Description |
+   | --- | --- | --- | --- |
+   | `srcToken` | string | yes | Source token address |
+   | `destToken` | string | yes | Destination token address |
+   | `srcDecimals` | number | yes | Source token decimals |
+   | `destDecimals` | number | yes | Destination token decimals |
+   | `amount` | string | yes | Per-slice amount (`floor(totalSrcAmount / numSlices)`) |
+   | `chainId` | number | yes | Source chain ID |
+   | `destChainId` | number | no | Destination chain ID (for cross-chain TWAP) |
+   | `userAddress` | string | yes | User's wallet address |
+   | `side` | string | yes | `"SELL"` or `"BUY"` |
+   | `mode` | string | yes | `"delta"` |
+
+   ```tsx title="Example"
+   const totalAmount = ethers.parseUnits('1', 6); // 1 USDC
+   const NUM_SLICES = 3;
+   const perSliceAmount = (totalAmount / BigInt(NUM_SLICES)).toString();
+
+   const { data: { delta: price } } = await axios.get(`${RELAYER_URL}/quote`, {
+     params: {
+       srcToken: USDC,
+       destToken: NATIVE_TOKEN_ADDRESS,
+       srcDecimals: 6,
+       destDecimals: 18,
+       amount: perSliceAmount,
+       chainId: 10,
+       userAddress,
+       side: 'SELL',
+       mode: 'delta',
+     },
+   });
+   ```
+
+   <Aside type="caution">
+   The quote `amount` must equal `floor(totalSrcAmount / numSlices)`. The build endpoint validates this.
+   </Aside>
+
+2. ### Build the Order
+
+   Use the price quote to build an unsigned TWAP order.
+
+   ```text
+   POST /orders/build
+   ```
+
+   | Parameter | Type | Required | Description |
+   | --- | --- | --- | --- |
+   | `onChainOrderType` | string | yes | Must be `"TWAPOrder"` |
+   | `price` | object | yes | The full `delta` price object from step 1 |
+   | `chainId` | number | yes | Source chain ID |
+   | `owner` | string | yes | User's wallet address |
+   | `beneficiary` | string | no | Recipient address (defaults to `owner`) |
+   | `slippage` | number | no | Slippage tolerance in bps (default: 100 = 1%) |
+   | `totalSrcAmount` | string | yes | Total source token amount across all slices |
+   | `numSlices` | number | yes | Number of slices (minimum: 2) |
+   | `interval` | number | yes | Seconds between slice executions (minimum: 60) |
+   | `bridge` | object | no | Bridge parameters from quote (for cross-chain) |
+   | `deadline` | number | no | Unix timestamp deadline (default: 1 hour) |
+   | `permit` | string | no | Permit signature bytes (default: `"0x"`) |
+   | `partnerAddress` | string | no | Partner address for fee sharing |
+   | `partnerFeeBps` | number | no | Partner fee in bps (0-200) |
+
+   ```tsx title="Example"
+   const { data: builtOrder } = await axios.post(`${RELAYER_URL}/orders/build`, {
+     onChainOrderType: 'TWAPOrder',
+     price,
+     chainId: 10,
+     owner: userAddress,
+     slippage: 1_000, // 10%
+     totalSrcAmount: totalAmount.toString(),
+     numSlices: 3,
+     interval: 60,
+     bridge: price.bridge, // include for cross-chain
+   });
+   ```
+
+   **Response** contains `toSign` with the EIP-712 typed data:
+
+   ```json
+   {
+     "toSign": {
+       "domain": { "name": "Portikus", "version": "2.0.0" },
+       "types": {
+         "TWAPOrder": [
+           { "name": "owner", "type": "address" },
+           { "name": "beneficiary", "type": "address" },
+           { "name": "srcToken", "type": "address" },
+           { "name": "destToken", "type": "address" },
+           { "name": "nonce", "type": "uint256" },
+           { "name": "partnerAndFee", "type": "uint256" },
+           { "name": "deadline", "type": "uint64" },
+           { "name": "interval", "type": "uint64" },
+           { "name": "numSlices", "type": "uint32" },
+           { "name": "destAmountPerSlice", "type": "uint256" },
+           { "name": "totalSrcAmount", "type": "uint256" },
+           { "name": "permit", "type": "bytes" },
+           { "name": "metadata", "type": "bytes" },
+           { "name": "bridge", "type": "Bridge" }
+         ]
+       },
+       "value": {}
+     }
+   }
+   ```
+
+3. ### Sign the Order (EIP-712)
+
+   Sign the typed data hash using the user's private key.
+
+   ```tsx
+   const { domain, types, value: order } = builtOrder.toSign;
+
+   const typedHash = TypedDataEncoder.hash(domain, types, order);
+   const signature = wallet.signingKey.sign(typedHash).compactSerialized;
+   ```
+
+   Or with a browser wallet (e.g. ethers Signer):
+
+   ```tsx
+   const signature = await signer.signTypedData(domain, types, order);
+   ```
+
+4. ### Submit the Order
+
+   ```text
+   POST /orders
+   ```
+
+   | Parameter | Type | Required | Description |
+   | --- | --- | --- | --- |
+   | `order` | object | yes | The `toSign.value` object from step 2 |
+   | `signature` | string | yes | EIP-712 compact signature from step 3 |
+   | `chainId` | number | yes | Source chain ID |
+
+   ```tsx title="Example"
+   const { data } = await axios.post(`${RELAYER_URL}/orders`, {
+     order,
+     signature,
+     chainId: 10,
+   });
+
+   const orderId = data.id;
+   ```
+
+   ```json title="Response"
+   {
+     "id": "order-uuid"
+   }
+   ```
+
+5. ### Track Order Status
+
+   ```text
+   GET /orders/:orderId
+   ```
+
+   Poll this endpoint to track execution progress. TWAP orders go through multiple auction cycles (one per slice).
+
+   | Status | Terminal | Description |
+   | --- | --- | --- |
+   | `NOT_STARTED` | no | Waiting to enter auction |
+   | `RUNNING` | no | Actively in a batch auction |
+   | `EXECUTING` | no | Assigned to an agent, on-chain execution pending |
+   | `INSUFFICIENT_BALANCE` | no | User balance dropped; will retry when restored |
+   | `INSUFFICIENT_ALLOWANCE` | no | User allowance revoked; will retry when restored |
+   | `EXECUTED` | yes | All slices successfully executed |
+   | `FAILED` | yes | Execution failed after retries |
+   | `EXPIRED` | yes | Deadline passed without full execution |
+   | `CANCELLING` | no | Cancellation in progress (best-effort) |
+   | `CANCELLED` | yes | Cancelled by user |
+
+   ```tsx title="Example"
+   const poll = setInterval(async () => {
+     const { data } = await axios.get(`${RELAYER_URL}/orders/${orderId}`);
+     console.log(data.status);
+
+     if (data.status === 'EXECUTED' || data.status === 'FAILED') {
+       clearInterval(poll);
+     }
+   }, 5000);
+   ```
+
+</Steps>
+
+### Building the Order Client-Side (without `/orders/build`)
+
+If you prefer to construct the TWAP sell order yourself instead of calling `/orders/build`, you can assemble the order struct, EIP-712 domain, and types manually. This is useful when you want full control over the order parameters or want to avoid an extra round-trip.
+
+#### EIP-712 Domain
+
+```tsx
+const domain = {
+  name: 'Portikus',
+  version: '2.0.0',
+  chainId,                    // e.g. 10 for Optimism
+  verifyingContract: DELTA_CONTRACT_ADDRESS, // the ParaswapDelta (Portikus) contract address on this chain
+};
+```
+
+<Aside>
+The `verifyingContract` is the Portikus contract deployed on the source chain. You can obtain it from the `/prices` or `/quote` response (`deltaAddress` field).
+</Aside>
+
+#### EIP-712 Types
+
+```tsx
+const types = {
+  TWAPOrder: [
+    { name: 'owner', type: 'address' },
+    { name: 'beneficiary', type: 'address' },
+    { name: 'srcToken', type: 'address' },
+    { name: 'destToken', type: 'address' },
+    { name: 'nonce', type: 'uint256' },
+    { name: 'partnerAndFee', type: 'uint256' },
+    { name: 'deadline', type: 'uint64' },
+    { name: 'interval', type: 'uint64' },
+    { name: 'numSlices', type: 'uint32' },
+    { name: 'destAmountPerSlice', type: 'uint256' },
+    { name: 'totalSrcAmount', type: 'uint256' },
+    { name: 'permit', type: 'bytes' },
+    { name: 'metadata', type: 'bytes' },
+    { name: 'bridge', type: 'Bridge' },
+  ],
+  Bridge: [
+    { name: 'protocolSelector', type: 'bytes4' },
+    { name: 'destinationChainId', type: 'uint256' },
+    { name: 'outputToken', type: 'address' },
+    { name: 'scalingFactor', type: 'int8' },
+    { name: 'protocolData', type: 'bytes' },
+  ],
+};
+```
+
+#### Computing Order Fields
+
+<details>
+<summary>destAmountPerSlice</summary>
+
+Apply slippage to the quoted `destAmount` (which is the per-slice dest amount):
+
+```tsx
+const slippage = 1_000; // 10% in bps
+const destAmountPerSlice = (
+  BigInt(price.destAmount) * BigInt(10_000 - slippage) / 10_000n
+).toString();
+```
+
+</details>
+
+<details>
+<summary>nonce</summary>
+
+Generate a unique nonce. The relayer uses `SHA-256(owner + timestamp)` interpreted as a uint256:
+
+```tsx
+import * as crypto from 'crypto';
+
+const nonce = BigInt(
+  '0x' + crypto.createHash('sha256')
+    .update(`${ownerAddress}${Date.now()}`)
+    .digest('hex')
+).toString();
+```
+
+Any unique uint256 works — the only requirement is that it hasn't been used for a previously executed order by the same owner.
+
+</details>
+
+<details>
+<summary>partnerAndFee</summary>
+
+Encodes the partner address, fee bps, and surplus flags into a single uint256:
+
+```tsx
+function encodePartnerAndFee(
+  partnerAddress: string,  // zero address if no partner
+  partnerFeeBps: number,   // 0-200
+  partnerTakesSurplus: boolean,
+  capSurplus: boolean,
+): string {
+  let encoded = 0n;
+
+  if (capSurplus) {
+    encoded |= 0x0200n; // CAP_SURPLUS_MASK
+  }
+
+  // if no partner, skip partner-specific encoding
+  if (partnerAddress === ethers.ZeroAddress) {
+    return encoded.toString();
+  }
+
+  encoded |= BigInt(partnerAddress) << 96n;
+  encoded |= BigInt(partnerFeeBps);
+
+  if (partnerTakesSurplus) {
+    encoded |= 0x0100n; // PARTNER_TAKES_SURPLUS_MASK
+  }
+
+  return encoded.toString();
+}
+```
+
+For most integrations without a partner, `partnerAndFee` is simply `"512"` (only the `capSurplus` flag set: `0x0200 = 512`).
+
+</details>
+
+<details>
+<summary>bridge (same-chain)</summary>
+
+For same-chain orders, use default bridge parameters:
+
+```tsx
+const bridge = {
+  protocolSelector: '0x00000000',
+  destinationChainId: 0,
+  outputToken: ethers.ZeroAddress,
+  scalingFactor: 0,
+  protocolData: '0x',
+};
+```
+
+</details>
+
+<details>
+<summary>bridge (cross-chain)</summary>
+
+For cross-chain orders, use the bridge parameters from the quote response, but **override `protocolData` to `'0x'`** — the relayer dynamically fills bridge data per slice at execution time:
+
+```tsx
+const bridge = {
+  ...price.bridge,
+  protocolData: '0x', // always '0x' for TWAP orders
+};
+```
+
+</details>
+
+#### Full Example
+
+```tsx title="twap-sell-client-side.ts"
+import { ethers, TypedDataEncoder } from 'ethers';
+import * as crypto from 'crypto';
+
+// --- Parameters ---
+const chainId = 10;
+const totalAmount = ethers.parseUnits('1', 6);
+const NUM_SLICES = 3;
+const INTERVAL = 60;
+const slippage = 1_000; // 10%
+const perSliceAmount = totalAmount / BigInt(NUM_SLICES);
+
+// --- 1. Get quote for one slice ---
+const { data: { delta: price, deltaAddress } } = await axios.get(`${RELAYER_URL}/quote`, {
+  params: {
+    srcToken: USDC,
+    destToken: NATIVE_TOKEN_ADDRESS,
+    srcDecimals: 6,
+    destDecimals: 18,
+    amount: perSliceAmount.toString(),
+    chainId,
+    userAddress,
+    side: 'SELL',
+    mode: 'delta',
+  },
+});
+
+// --- 2. Build order struct ---
+const nonce = BigInt(
+  '0x' + crypto.createHash('sha256')
+    .update(`${userAddress}${Date.now()}`)
+    .digest('hex')
+).toString();
+
+const destAmountPerSlice = (
+  BigInt(price.destAmount) * BigInt(10_000 - slippage) / 10_000n
+).toString();
+
+const order = {
+  owner: userAddress,
+  beneficiary: ethers.ZeroAddress, // zero address means owner receives
+  srcToken: price.srcToken,
+  destToken: price.destToken,
+  nonce,
+  partnerAndFee: '512', // capSurplus=true, no partner
+  deadline: Math.floor(Date.now() / 1000) + 3600, // 1 hour
+  interval: INTERVAL,
+  numSlices: NUM_SLICES,
+  destAmountPerSlice,
+  totalSrcAmount: totalAmount.toString(),
+  permit: '0x',
+  metadata: '0x',
+  bridge: {
+    protocolSelector: '0x00000000',
+    destinationChainId: 0,
+    outputToken: ethers.ZeroAddress,
+    scalingFactor: 0,
+    protocolData: '0x',
+  },
+};
+
+// --- 3. Sign ---
+const domain = {
+  name: 'Portikus',
+  version: '2.0.0',
+  chainId,
+  verifyingContract: deltaAddress,
+};
+
+const typedHash = TypedDataEncoder.hash(domain, types, order);
+const signature = wallet.signingKey.sign(typedHash).compactSerialized;
+
+// --- 4. Submit ---
+const { data } = await axios.post(`${RELAYER_URL}/orders`, {
+  order,
+  signature,
+  chainId,
+});
+
+console.log('Order ID:', data.id);
+```
+
+### TWAPOrder Fields Reference
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `owner` | `address` | Wallet that owns the tokens |
+| `beneficiary` | `address` | Receives output tokens (zero address = owner) |
+| `srcToken` | `address` | Token being sold |
+| `destToken` | `address` | Token being bought |
+| `nonce` | `uint256` | Unique nonce for replay protection |
+| `partnerAndFee` | `uint256` | Encoded partner address and fee bps |
+| `deadline` | `uint64` | Unix timestamp after which the order expires |
+| `interval` | `uint64` | Seconds between slice executions (min 60) |
+| `numSlices` | `uint32` | Number of slices (min 2) |
+| `destAmountPerSlice` | `uint256` | Minimum output per slice (after slippage) |
+| `totalSrcAmount` | `uint256` | Total source tokens across all slices |
+| `permit` | `bytes` | Optional ERC-2612 permit signature |
+| `metadata` | `bytes` | Optional metadata (default `"0x"`) |
+| `bridge` | `Bridge` | Bridge parameters (for cross-chain swaps) |
+
+### Execution Mechanics
+
+- Each slice gets `floor(totalSrcAmount / numSlices)` tokens, except the **last slice** which gets the remainder (handles rounding).
+- Slices execute sequentially — the next slice enters the auction after `interval` seconds.
+- Each slice goes through an independent sealed-bid auction.
+- The `destAmountPerSlice` enforces a minimum output per slice (set based on the quote minus slippage).
+- The relayer cosigns each slice with a `TWAPSlice` struct containing the exact execution parameters.
+- Balance and allowance are validated for the **full** `totalSrcAmount`, not per-slice.
+
+### Cross-Chain TWAP Sell
+
+For cross-chain TWAP sell orders, include `destChainId` in the quote request and pass `bridge: price.bridge` to the build endpoint. Each slice is bridged independently.
+
+```tsx
+// Quote with destination chain
+const { data: { delta: price } } = await axios.get(`${RELAYER_URL}/quote`, {
+  params: {
+    srcToken: USDC,
+    destToken: NATIVE_TOKEN_ADDRESS,
+    srcDecimals: 6,
+    destDecimals: 18,
+    amount: perSliceAmount,
+    chainId: 10,       // source: Optimism
+    destChainId: 8453, // destination: Base
+    userAddress,
+    side: 'SELL',
+    mode: 'delta',
+  },
+});
+
+// Build with bridge params
+const { data: builtOrder } = await axios.post(`${RELAYER_URL}/orders/build`, {
+  onChainOrderType: 'TWAPOrder',
+  price,
+  chainId: 10,
+  owner: userAddress,
+  slippage: 1_000,
+  totalSrcAmount: totalAmount.toString(),
+  numSlices: 2,
+  interval: 60,
+  bridge: price.bridge,
+});
+```
+
+### Validation Rules
+
+- `numSlices` must be >= 2
+- `interval` must be >= 60 seconds
+- `price.srcAmount` must equal `floor(totalSrcAmount / numSlices)`
+- User must have approved `totalSrcAmount` to the Delta contract
+- User must hold at least `totalSrcAmount` of `srcToken`
+- `deadline` must be in the future
+
+---
+
+## TWAP Buy Orders
+
+TWAP Buy orders let a user accumulate a fixed destination token amount across multiple slices, while capping the total source token spend. The user specifies `totalDestAmount` (exact amount to receive) and `maxSrcAmount` (maximum willing to spend).
+
+<Steps>
+
+1. ### Get a Price Quote
+
+   Request a quote for a **single slice** dest amount (i.e. `floor(totalDestAmount / numSlices)`) using `side: 'BUY'`.
+
+   ```text
+   GET /quote
+   ```
+
+   | Parameter | Type | Required | Description |
+   | --- | --- | --- | --- |
+   | `srcToken` | string | yes | Source token address |
+   | `destToken` | string | yes | Destination token address |
+   | `srcDecimals` | number | yes | Source token decimals |
+   | `destDecimals` | number | yes | Destination token decimals |
+   | `amount` | string | yes | Per-slice dest amount (`floor(totalDestAmount / numSlices)`) |
+   | `chainId` | number | yes | Source chain ID |
+   | `destChainId` | number | no | Destination chain ID (for cross-chain TWAP) |
+   | `userAddress` | string | yes | User's wallet address |
+   | `side` | string | yes | Must be `"BUY"` |
+   | `mode` | string | yes | `"delta"` |
+
+   ```tsx title="Example"
+   const totalDestAmount = ethers.parseUnits('1', 18); // 1 ETH to buy
+   const NUM_SLICES = 3;
+   const perSliceDestAmount = (totalDestAmount / BigInt(NUM_SLICES)).toString();
+
+   const { data: { delta: price } } = await axios.get(`${RELAYER_URL}/quote`, {
+     params: {
+       srcToken: USDC,
+       destToken: WETH,
+       srcDecimals: 6,
+       destDecimals: 18,
+       amount: perSliceDestAmount,
+       chainId: 10,
+       userAddress,
+       side: 'BUY',
+       mode: 'delta',
+     },
+   });
+   ```
+
+   <Aside type="caution">
+   The quote `amount` must equal `floor(totalDestAmount / numSlices)`. The build endpoint validates that `price.destAmount` matches this value.
+   </Aside>
+
+2. ### Build the Order
+
+   Use the price quote to build an unsigned TWAP Buy order.
+
+   ```text
+   POST /orders/build
+   ```
+
+   | Parameter | Type | Required | Description |
+   | --- | --- | --- | --- |
+   | `onChainOrderType` | string | yes | Must be `"TWAPBuyOrder"` |
+   | `price` | object | yes | The full `delta` price object from step 1 |
+   | `chainId` | number | yes | Source chain ID |
+   | `owner` | string | yes | User's wallet address |
+   | `beneficiary` | string | no | Recipient address (defaults to `owner`) |
+   | `totalDestAmount` | string | yes | Total destination token amount to buy |
+   | `maxSrcAmount` | string | yes | Maximum source token amount willing to spend |
+   | `numSlices` | number | yes | Number of slices (minimum: 2) |
+   | `interval` | number | yes | Seconds between slice executions (minimum: 60) |
+   | `bridge` | object | no | Bridge parameters from quote (for cross-chain) |
+   | `deadline` | number | no | Unix timestamp deadline (default: 1 hour) |
+   | `permit` | string | no | Permit signature bytes (default: `"0x"`) |
+   | `partnerAddress` | string | no | Partner address for fee sharing |
+   | `partnerFeeBps` | number | no | Partner fee in bps (0-200) |
+
+   ```tsx title="Example"
+   const { data: builtOrder } = await axios.post(`${RELAYER_URL}/orders/build`, {
+     onChainOrderType: 'TWAPBuyOrder',
+     price,
+     chainId: 10,
+     owner: userAddress,
+     totalDestAmount: totalDestAmount.toString(),
+     maxSrcAmount: ethers.parseUnits('3000', 6).toString(), // max 3000 USDC
+     numSlices: 3,
+     interval: 60,
+     bridge: price.bridge, // include for cross-chain
+   });
+   ```
+
+   **Response** contains `toSign` with the EIP-712 typed data:
+
+   ```json
+   {
+     "toSign": {
+       "domain": { "name": "Portikus", "version": "2.0.0" },
+       "types": {
+         "TWAPBuyOrder": [
+           { "name": "owner", "type": "address" },
+           { "name": "beneficiary", "type": "address" },
+           { "name": "srcToken", "type": "address" },
+           { "name": "destToken", "type": "address" },
+           { "name": "nonce", "type": "uint256" },
+           { "name": "partnerAndFee", "type": "uint256" },
+           { "name": "deadline", "type": "uint64" },
+           { "name": "interval", "type": "uint64" },
+           { "name": "numSlices", "type": "uint32" },
+           { "name": "totalDestAmount", "type": "uint256" },
+           { "name": "maxSrcAmount", "type": "uint256" },
+           { "name": "permit", "type": "bytes" },
+           { "name": "metadata", "type": "bytes" },
+           { "name": "bridge", "type": "Bridge" }
+         ]
+       },
+       "value": {}
+     }
+   }
+   ```
+
+3. ### Sign and Submit
+
+   Signing and submitting follow the same process as TWAP sell orders — see steps 3-5 above.
+
+</Steps>
+
+### Building the Order Client-Side (without `/orders/build`)
+
+#### EIP-712 Types
+
+```tsx
+const types = {
+  TWAPBuyOrder: [
+    { name: 'owner', type: 'address' },
+    { name: 'beneficiary', type: 'address' },
+    { name: 'srcToken', type: 'address' },
+    { name: 'destToken', type: 'address' },
+    { name: 'nonce', type: 'uint256' },
+    { name: 'partnerAndFee', type: 'uint256' },
+    { name: 'deadline', type: 'uint64' },
+    { name: 'interval', type: 'uint64' },
+    { name: 'numSlices', type: 'uint32' },
+    { name: 'totalDestAmount', type: 'uint256' },
+    { name: 'maxSrcAmount', type: 'uint256' },
+    { name: 'permit', type: 'bytes' },
+    { name: 'metadata', type: 'bytes' },
+    { name: 'bridge', type: 'Bridge' },
+  ],
+  Bridge: [
+    { name: 'protocolSelector', type: 'bytes4' },
+    { name: 'destinationChainId', type: 'uint256' },
+    { name: 'outputToken', type: 'address' },
+    { name: 'scalingFactor', type: 'int8' },
+    { name: 'protocolData', type: 'bytes' },
+  ],
+};
+```
+
+The EIP-712 domain, `nonce`, `partnerAndFee`, and `bridge` fields are computed the same way as for TWAP sell orders (see above).
+
+#### Full Example
+
+```tsx title="twap-buy-client-side.ts"
+import { ethers, TypedDataEncoder } from 'ethers';
+import * as crypto from 'crypto';
+
+// --- Parameters ---
+const chainId = 10;
+const totalDestAmount = ethers.parseUnits('1', 18); // buy 1 ETH
+const NUM_SLICES = 3;
+const INTERVAL = 60;
+const perSliceDestAmount = totalDestAmount / BigInt(NUM_SLICES);
+
+// --- 1. Get quote for one slice (BUY side) ---
+const { data: { delta: price, deltaAddress } } = await axios.get(`${RELAYER_URL}/quote`, {
+  params: {
+    srcToken: USDC,
+    destToken: WETH,
+    srcDecimals: 6,
+    destDecimals: 18,
+    amount: perSliceDestAmount.toString(),
+    chainId,
+    userAddress,
+    side: 'BUY',
+    mode: 'delta',
+  },
+});
+
+// --- 2. Build order struct ---
+const nonce = BigInt(
+  '0x' + crypto.createHash('sha256')
+    .update(`${userAddress}${Date.now()}`)
+    .digest('hex')
+).toString();
+
+// maxSrcAmount: use the quoted srcAmount * numSlices, plus slippage as a cap
+const slippage = 1_000; // 10% in bps
+const maxSrcAmount = (
+  BigInt(price.srcAmount) * BigInt(NUM_SLICES) * BigInt(10_000 + slippage) / 10_000n
+).toString();
+
+const order = {
+  owner: userAddress,
+  beneficiary: ethers.ZeroAddress, // zero address means owner receives
+  srcToken: price.srcToken,
+  destToken: price.destToken,
+  nonce,
+  partnerAndFee: '512', // capSurplus=true, no partner
+  deadline: Math.floor(Date.now() / 1000) + 3600, // 1 hour
+  interval: INTERVAL,
+  numSlices: NUM_SLICES,
+  totalDestAmount: totalDestAmount.toString(),
+  maxSrcAmount,
+  permit: '0x',
+  metadata: '0x',
+  bridge: {
+    protocolSelector: '0x00000000',
+    destinationChainId: 0,
+    outputToken: ethers.ZeroAddress,
+    scalingFactor: 0,
+    protocolData: '0x',
+  },
+};
+
+// --- 3. Sign ---
+const domain = {
+  name: 'Portikus',
+  version: '2.0.0',
+  chainId,
+  verifyingContract: deltaAddress,
+};
+
+const typedHash = TypedDataEncoder.hash(domain, types, order);
+const signature = wallet.signingKey.sign(typedHash).compactSerialized;
+
+// --- 4. Submit ---
+const { data } = await axios.post(`${RELAYER_URL}/orders`, {
+  order,
+  signature,
+  chainId,
+});
+
+console.log('Order ID:', data.id);
+```
+
+### TWAPBuyOrder Fields Reference
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `owner` | `address` | Wallet that owns the source tokens |
+| `beneficiary` | `address` | Receives output tokens (zero address = owner) |
+| `srcToken` | `address` | Token being spent |
+| `destToken` | `address` | Token being bought |
+| `nonce` | `uint256` | Unique nonce for replay protection |
+| `partnerAndFee` | `uint256` | Encoded partner address and fee bps |
+| `deadline` | `uint64` | Unix timestamp after which the order expires |
+| `interval` | `uint64` | Seconds between slice executions (min 60) |
+| `numSlices` | `uint32` | Number of slices (min 2) |
+| `totalDestAmount` | `uint256` | Total destination tokens to buy across all slices |
+| `maxSrcAmount` | `uint256` | Maximum source tokens willing to spend (cap) |
+| `permit` | `bytes` | Optional ERC-2612 permit signature |
+| `metadata` | `bytes` | Optional metadata (default `"0x"`) |
+| `bridge` | `Bridge` | Bridge parameters (for cross-chain swaps) |
+
+### Execution Mechanics
+
+- Each slice buys `floor(totalDestAmount / numSlices)` dest tokens, except the **last slice** which buys the remainder (handles rounding).
+- Per-slice `maxSrcAmount` is derived proportionally: `floor(destPerSlice * maxSrcAmount / totalDestAmount)`.
+- Slices execute sequentially — the next slice enters the auction after `interval` seconds.
+- Each slice goes through an independent sealed-bid auction.
+- The relayer cosigns each slice with a `TWAPBuySlice` struct containing the exact execution parameters (`destAmount`, `maxSrcAmount`, `expectedSrcAmount`, `deadline`, `sliceIndex`, `bridgeOverride`).
+- Balance and allowance are validated for the **full** `maxSrcAmount`, not per-slice.
+
+### Validation Rules
+
+- `numSlices` must be >= 2
+- `interval` must be >= 60 seconds
+- `totalDestAmount` must be >= `numSlices` (so each slice gets at least 1 wei)
+- `price.destAmount` must equal `floor(totalDestAmount / numSlices)`
+- `deadline` must allow enough time for all slices: `deadline - now >= numSlices * interval`
+- User must have approved `maxSrcAmount` to the Delta contract
+- User must hold at least `maxSrcAmount` of `srcToken`
