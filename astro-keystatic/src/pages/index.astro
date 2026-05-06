@@ -1,0 +1,24 @@
+---
+import { getCollection } from "astro:content";
+import Layout from "../layouts/Layout.astro";
+
+const posts = await getCollection("posts");
+---
+
+<Layout title="Keystatic & Astro's Content Collections">
+  <div>
+    <p>
+      <a href="/keystatic">Admin UI</a>
+    </p>
+    <h2>Posts</h2>
+    <ul>
+      {
+        posts.map((post) => (
+          <li>
+            <a href={`/posts/${post.slug}`}>{post.data.title}</a>
+          </li>
+        ))
+      }
+    </ul>
+  </div>
+</Layout>
