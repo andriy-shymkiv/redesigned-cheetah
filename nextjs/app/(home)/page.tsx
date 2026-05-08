@@ -26,7 +26,7 @@ export default function HomePage() {
           <div className="mb-6 inline-block px-4 py-2 bg-blue-600/20 rounded-full text-blue-400 text-sm font-medium">
             Introducing Velora
           </div>
-          <h1 className="text-6xl md:text-7xl font-bold text-white mb-6 leading-tight">
+          <h1 className="text-6xl md:text-7xl font-bold text-[rgba(134,82,82,1)] mb-6 leading-tight">
             Crosschain Swaps with One-Click Trading
           </h1>
           <h2 className="text-2xl md:text-3xl text-orange-400 font-semibold mb-6">
