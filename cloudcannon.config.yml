@@ -1,0 +1,15 @@
+paths:
+  static: ''
+  uploads: uploads
+timezone: Europe/Kiev
+markdown:
+  engine: commonmark
+  options: {}
+source: /nextjs-naked/
+collections_config:
+  pages:
+    path: ''
+    icon: wysiwyg
+  app:
+    path: app
+    icon: api
